@@ -1,19 +1,18 @@
 """
-TSE Registro Civil scraper — v3 FAST
+TSE Registro Civil scraper — v4 FAST
 
-Estrategia dual:
-  1. Playwright (warmup único): abre la página una vez para resolver el desafío
-     JavaScript de Radware Bot Manager y extraer las cookies de sesión.
-     Se renueva automáticamente cada hora si las cookies expiran.
-  2. httpx (todas las consultas): reutiliza las cookies Radware para hacer
-     GET+POST directos al formulario ASP.NET. Latencia típica: 150-400ms.
+Estrategia:
+  1. Warmup (una vez): Playwright abre el formulario y resuelve el desafío
+     Radware Bot Manager. El contexto del browser queda con las cookies.
+  2. Consultas rápidas: usa `browser_context.request` de Playwright — el mismo
+     contexto que el browser, con el mismo fingerprint TLS y las mismas cookies.
+     Sin rendering, sin DOM, solo HTTP. Latencia ~150-400 ms por consulta.
 
-Por qué funciona: Radware emite una cookie de bypass (rbzid + rbzsessionid)
-que vale para toda la sesión HTTP, no solo para el primer request. Una vez
-obtenida con Playwright, httpx puede usarla sin limitaciones de tiempo
-mientras el TTL no expire (~1-2 horas en el bot manager del TSE).
+Por qué no httpx: Radware valida el fingerprint TLS (JA3/JA4). httpx tiene
+fingerprint diferente al Chromium, así que aunque enviemos las cookies, Radware
+las rechaza. `browser_context.request` comparte contexto con el browser real.
 
-Caché en memoria: resultados se cachean 24h (max 1 000 cédulas).
+Caché LRU en memoria: resultados 24h, máx 1 000 cédulas.
 """
 import asyncio
 import re
@@ -21,7 +20,6 @@ import time
 from collections import OrderedDict
 from typing import Optional
 
-import httpx
 from playwright.async_api import async_playwright
 
 BASE = "https://servicioselectorales.tse.go.cr/chc"
@@ -31,9 +29,9 @@ UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-COOKIE_TTL = 3600        # 1 hora — renovar cookies Radware
-CACHE_TTL  = 86400       # 24 horas — cachear resultados de cédula
-MAX_CACHE  = 1_000       # máx entradas en caché
+COOKIE_TTL   = 3600    # 1 hora — renovar warmup Radware
+CACHE_TTL    = 86400   # 24 horas — cachear resultados
+MAX_CACHE    = 1_000
 
 _STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -70,14 +68,12 @@ def _extract_viewstate(html: str) -> dict:
     }
 
 
-def _is_blocked(resp: httpx.Response) -> bool:
-    """Detecta si Radware nos bloqueó (pide JS challenge o devuelve 403)."""
-    if resp.status_code == 403:
+def _is_blocked(html: str, status: int) -> bool:
+    if status == 403:
         return True
-    text = resp.text[:2000]
-    return "rbzid" in text or "Bot Manager" in text or "challenge" in text.lower()
+    return "rbzid" in html[:2000] or "Bot Manager" in html[:2000]
 
-# ─── caché LRU simple ────────────────────────────────────────────────────────
+# ─── caché LRU ──────────────────────────────────────────────────────────────
 
 class _LRUCache:
     def __init__(self, maxsize: int, ttl: int):
@@ -109,7 +105,7 @@ class TSEScraper:
         self._headless = headless
         self._pw = None
         self._browser = None
-        self._cookies: dict[str, str] = {}
+        self._ctx = None                  # BrowserContext con cookies Radware
         self._cookies_at: float = 0.0
         self._warm_lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(max_concurrency)
@@ -130,26 +126,29 @@ class TSEScraper:
                 "--lang=es-CR",
             ],
         )
-        # Warm inicial en background — no bloquea el arranque
-        asyncio.create_task(self._warm_cookies())
+        # Warm en background — no bloquea el arranque del servidor
+        asyncio.create_task(self._warm())
 
     async def stop(self):
         try:
+            if self._ctx:
+                await self._ctx.close()
             if self._browser:
                 await self._browser.close()
         finally:
             if self._pw:
                 await self._pw.stop()
 
-    # ── warmup Radware con Playwright ────────────────────────────────────────
+    # ── warmup Radware ───────────────────────────────────────────────────────
 
-    async def _warm_cookies(self):
-        """Abre el formulario con Playwright para resolver el desafío Radware
-        y extraer las cookies de bypass. El lock garantiza un único warmup a la vez."""
+    async def _warm(self):
+        """Abre la página con Playwright para resolver el desafío Radware.
+        Guarda el BrowserContext con las cookies de bypass."""
         async with self._warm_lock:
             if time.time() - self._cookies_at < COOKIE_TTL:
-                return   # ya están frescas
+                return   # ya frescos
 
+            # Crear nuevo contexto
             ctx = await self._browser.new_context(
                 user_agent=UA,
                 locale="es-CR",
@@ -160,49 +159,98 @@ class TSEScraper:
             )
             ctx.set_default_navigation_timeout(90_000)
             await ctx.add_init_script(_STEALTH_JS)
+
             page = await ctx.new_page()
             try:
                 await page.goto(URL_CEDULA, wait_until="domcontentloaded")
                 await page.wait_for_selector("#txtcedula", timeout=60_000)
-                raw = await ctx.cookies()
-                self._cookies = {c["name"]: c["value"] for c in raw}
+                # Contexto con cookies válidas, guardarlo para requests rápidos
+                if self._ctx and self._ctx != ctx:
+                    try:
+                        await self._ctx.close()
+                    except Exception:
+                        pass
+                self._ctx = ctx
                 self._cookies_at = time.time()
-            finally:
+            except Exception:
                 try:
-                    await page.close()
                     await ctx.close()
                 except Exception:
                     pass
+                raise
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
-    async def _ensure_cookies(self):
-        """Garantiza cookies válidas; renueva si expiró el TTL."""
-        if time.time() - self._cookies_at >= COOKIE_TTL:
-            await self._warm_cookies()
+    async def _ensure_warm(self):
+        if time.time() - self._cookies_at >= COOKIE_TTL or self._ctx is None:
+            await self._warm()
 
-    # ── cliente httpx ────────────────────────────────────────────────────────
+    # ── consultas rápidas vía browser_context.request ────────────────────────
+    # Usar ctx.request en vez de httpx porque Radware valida fingerprint TLS.
+    # browser_context.request comparte el mismo contexto + cookies + TLS.
 
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            headers={
-                "User-Agent": UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "es-CR,es;q=0.9,en-US;q=0.5,en;q=0.3",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-            },
-            cookies=self._cookies,
-            follow_redirects=True,
-            timeout=httpx.Timeout(10.0, connect=5.0),
-        )
+    async def _ctx_post_cedula(self, ced: str) -> str:
+        """GET formulario → extraer ViewState → POST cédula.
+        Retorna el HTML de resultado_persona.aspx."""
+        req = self._ctx.request   # APIRequestContext compartido con el browser
 
-    # ── consulta por cédula ──────────────────────────────────────────────────
+        # 1. GET formulario
+        r_get = await req.get(URL_CEDULA)
+        html_form = await r_get.text()
+        if _is_blocked(html_form, r_get.status):
+            raise RuntimeError("Radware bloqueó GET formulario")
+
+        vs = _extract_viewstate(html_form)
+
+        # 2. POST cédula (sigue redirects automáticamente)
+        r_post = await req.post(URL_CEDULA, form={
+            "__VIEWSTATE":          vs["vs"],
+            "__VIEWSTATEGENERATOR": vs["vsg"],
+            "__EVENTVALIDATION":    vs["ev"],
+            "txtcedula":            ced,
+            "btnConsultaCedula":    "Consultar",
+        })
+        html = await r_post.text()
+        if _is_blocked(html, r_post.status):
+            raise RuntimeError("Radware bloqueó POST cédula")
+        return html
+
+    async def _ctx_post_nombres(self, nombre: str, ap1: str, ap2: str) -> str:
+        """GET formulario nombres → extraer ViewState → POST."""
+        req = self._ctx.request
+
+        r_get = await req.get(URL_NOMBRES)
+        html_form = await r_get.text()
+        if _is_blocked(html_form, r_get.status):
+            raise RuntimeError("Radware bloqueó GET nombres")
+
+        vs = _extract_viewstate(html_form)
+
+        r_post = await req.post(URL_NOMBRES, form={
+            "__VIEWSTATE":          vs["vs"],
+            "__VIEWSTATEGENERATOR": vs["vsg"],
+            "__EVENTVALIDATION":    vs["ev"],
+            "txtnombre":            nombre,
+            "txtapellido1":         ap1 or "",
+            "txtapellido2":         ap2 or "",
+            "btnConsultarNombre":   "Consultar",
+        })
+        html = await r_post.text()
+        if _is_blocked(html, r_post.status):
+            raise RuntimeError("Radware bloqueó POST nombres")
+        return html
+
+    # ── API pública ──────────────────────────────────────────────────────────
 
     async def consulta_cedula(self, cedula: str) -> dict:
         ced = re.sub(r"\D", "", cedula)
         if not ced:
             raise ValueError("Cédula inválida")
 
-        # Caché hit → respuesta instantánea
+        # Cache hit → respuesta instantánea
         cached = self._cache.get(ced)
         if cached is not None:
             return cached
@@ -211,104 +259,50 @@ class TSEScraper:
             return await self._fetch_cedula(ced)
 
     async def _fetch_cedula(self, ced: str, retry: bool = True) -> dict:
-        await self._ensure_cookies()
-
+        await self._ensure_warm()
         try:
-            async with self._client() as cli:
-                # 1. GET formulario → extraer ViewState ASP.NET
-                r_get = await cli.get(URL_CEDULA)
-                if _is_blocked(r_get):
-                    raise RuntimeError("Radware bloqueó GET formulario")
-
-                vs = _extract_viewstate(r_get.text)
-
-                # 2. POST cédula → redirige a resultado_persona.aspx
-                r_post = await cli.post(URL_CEDULA, data={
-                    "__VIEWSTATE":          vs["vs"],
-                    "__VIEWSTATEGENERATOR": vs["vsg"],
-                    "__EVENTVALIDATION":    vs["ev"],
-                    "txtcedula":            ced,
-                    "btnConsultaCedula":    "Consultar",
-                })
-
-                if _is_blocked(r_post):
-                    raise RuntimeError("Radware bloqueó POST")
-
-                result = _parse_persona(r_post.text, ced)
+            html = await self._ctx_post_cedula(ced)
         except RuntimeError:
-            # Cookies vencidas: renovar y reintentar una vez
             if retry:
                 self._cookies_at = 0
-                await self._warm_cookies()
+                await self._warm()
                 return await self._fetch_cedula(ced, retry=False)
             raise
 
+        result = _parse_persona(html, ced)
         if result.get("encontrado"):
             self._cache.set(ced, result)
         return result
 
-    # ── consulta por nombre ──────────────────────────────────────────────────
-
     async def consulta_nombres(
-        self,
-        nombre: str,
-        apellido1: str = "",
-        apellido2: str = "",
-        limite: int = 50,
+        self, nombre: str, apellido1: str = "", apellido2: str = "", limite: int = 50
     ) -> dict:
         if not nombre or not nombre.strip():
             raise ValueError("El campo 'nombre' es obligatorio para el TSE")
 
         async with self._sem:
-            return await self._fetch_nombres(nombre, apellido1, apellido2, limite)
+            return await self._fetch_nombres(nombre, apellido1, apellido2)
 
     async def _fetch_nombres(
-        self,
-        nombre: str,
-        apellido1: str,
-        apellido2: str,
-        limite: int,
-        retry: bool = True,
+        self, nombre: str, ap1: str, ap2: str, retry: bool = True
     ) -> dict:
-        await self._ensure_cookies()
-
+        await self._ensure_warm()
         try:
-            async with self._client() as cli:
-                r_get = await cli.get(URL_NOMBRES)
-                if _is_blocked(r_get):
-                    raise RuntimeError("Radware bloqueó GET nombres")
-
-                vs = _extract_viewstate(r_get.text)
-
-                r_post = await cli.post(URL_NOMBRES, data={
-                    "__VIEWSTATE":          vs["vs"],
-                    "__VIEWSTATEGENERATOR": vs["vsg"],
-                    "__EVENTVALIDATION":    vs["ev"],
-                    "txtnombre":            nombre,
-                    "txtapellido1":         apellido1 or "",
-                    "txtapellido2":         apellido2 or "",
-                    "btnConsultarNombre":   "Consultar",
-                })
-
-                if _is_blocked(r_post):
-                    raise RuntimeError("Radware bloqueó POST nombres")
-
-                return _parse_lista_nombres(r_post.text)
-
+            html = await self._ctx_post_nombres(nombre, ap1, ap2)
         except RuntimeError:
             if retry:
                 self._cookies_at = 0
-                await self._warm_cookies()
-                return await self._fetch_nombres(nombre, apellido1, apellido2, limite, retry=False)
+                await self._warm()
+                return await self._fetch_nombres(nombre, ap1, ap2, retry=False)
             raise
 
-    # ── health ───────────────────────────────────────────────────────────────
+        return _parse_lista_nombres(html)
 
     async def health(self) -> dict:
-        cookies_ok = time.time() - self._cookies_at < COOKIE_TTL
+        warm = time.time() - self._cookies_at < COOKIE_TTL and self._ctx is not None
         return {
-            "status":       "ok" if cookies_ok else "warming",
-            "bot_wall":     "superado" if cookies_ok else "pendiente",
+            "status":        "ok" if warm else "warming",
+            "bot_wall":      "superado" if warm else "pendiente",
             "cookies_age_s": int(time.time() - self._cookies_at) if self._cookies_at else None,
             "cache_entries": len(self._cache._d),
         }
@@ -325,14 +319,14 @@ def _parse_persona(html: str, ced: str) -> dict:
     defuncion = " ".join(x for x in [g("lbldefuncion2"), g("lbldefunciontemporal")] if x).strip()
 
     return {
-        "encontrado":     bool(g("lblcedula")),
-        "cedula":         g("lblcedula") or ced,
+        "encontrado":      bool(g("lblcedula")),
+        "cedula":          g("lblcedula") or ced,
         "nombre_completo": g("lblnombrecompleto"),
-        "conocido_como":  g("lblconocidocomo"),
+        "conocido_como":   g("lblconocidocomo"),
         "fecha_nacimiento": g("lblfechaNacimiento"),
-        "edad":           g("lbledad"),
-        "nacionalidad":   g("lblnacionalidad"),
-        "marginal":       g("lblLeyendaMarginal"),
+        "edad":            g("lbledad"),
+        "nacionalidad":    g("lblnacionalidad"),
+        "marginal":        g("lblLeyendaMarginal"),
         "padre": {
             "nombre":         g("lblnombrepadre"),
             "identificacion": g("lblid_padre"),
@@ -341,9 +335,9 @@ def _parse_persona(html: str, ced: str) -> dict:
             "nombre":         g("lblnombremadre"),
             "identificacion": g("lblid_madre"),
         },
-        "fallecido":  bool(defuncion),
-        "defuncion":  defuncion or None,
-        "fuente":     "resultado_persona.aspx (Registro Civil TSE)",
+        "fallecido": bool(defuncion),
+        "defuncion": defuncion or None,
+        "fuente":    "resultado_persona.aspx (Registro Civil TSE)",
     }
 
 
@@ -361,15 +355,15 @@ def _parse_lista_nombres(html: str) -> dict:
         m = _ROW.match(line)
         if m:
             resultados.append({
-                "cedula":         m.group(1),
+                "cedula":          m.group(1),
                 "nombre_completo": _clean(m.group(2)),
-                "fallecido":      bool(m.group(3)),
+                "fallecido":       bool(m.group(3)),
             })
     pag = re.search(r"P[áa]gina\s*#?\s*(\d+)\s*de un total de\s*(\d+)", body, re.I)
     return {
-        "total":          len(resultados),
-        "pagina":         int(pag.group(1)) if pag else 1,
+        "total":           len(resultados),
+        "pagina":          int(pag.group(1)) if pag else 1,
         "paginas_totales": int(pag.group(2)) if pag else 1,
-        "resultados":     resultados,
-        "fuente":         "muestra_nombres.aspx (Registro Civil TSE)",
+        "resultados":      resultados,
+        "fuente":          "muestra_nombres.aspx (Registro Civil TSE)",
     }
