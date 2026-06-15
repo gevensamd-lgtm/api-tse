@@ -254,8 +254,8 @@ class TSEScraper:
 
     # ── navegación directa en el browser ────────────────────────────────────
 
-    async def _browser_fetch_cedula(self, ced: str) -> str:
-        """Rellena y envía el form en el browser real. Devuelve HTML."""
+    async def _browser_fetch_cedula(self, ced: str) -> tuple[str, str | None]:
+        """Rellena y envía el form. Devuelve (html_persona, html_detalle_nacimiento|None)."""
         page = self._page_cedula
         await page.fill("#txtcedula", ced)
         try:
@@ -263,7 +263,20 @@ class TSEScraper:
                 await page.click("#btnConsultaCedula")
         except Exception as e:
             raise RuntimeError(f"Timeout navegando TSE para cédula: {e}")
-        return await page.content()
+        html_persona = await page.content()
+
+        # Seguir "Ver Más Detalles" → detalle_nacimiento.aspx (lugar de nacimiento)
+        html_detalle: str | None = None
+        try:
+            link = page.locator("a[href*='detalle_nacimiento']")
+            if await link.count() > 0:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=QUERY_TIMEOUT):
+                    await link.first.click()
+                html_detalle = await page.content()
+        except Exception:
+            pass  # fail-soft: si no hay enlace o falla, se continúa sin detalle
+
+        return html_persona, html_detalle
 
     async def _browser_fetch_nombres(self, nombre: str, ap1: str, ap2: str) -> str:
         """Rellena y envía el form de nombres en el browser real."""
@@ -307,7 +320,7 @@ class TSEScraper:
     async def _fetch_cedula(self, ced: str, retry: bool = True) -> dict:
         await self._ensure_warm()
         try:
-            html = await self._browser_fetch_cedula(ced)
+            html, html_detalle = await self._browser_fetch_cedula(ced)
         except RuntimeError:
             if retry:
                 self._warmed_at = 0
@@ -330,6 +343,10 @@ class TSEScraper:
             raise RuntimeError("Radware bloqueó la consulta de cédula")
 
         result = _parse_persona(html, ced)
+        if html_detalle:
+            detalle = _parse_detalle_nacimiento(html_detalle)
+            result.update({k: v for k, v in detalle.items() if v})
+
         if result.get("encontrado"):
             self._cache.set(ced, result)
 
@@ -426,6 +443,60 @@ def _parse_persona(html: str, ced: str) -> dict:
         "defuncion": defuncion or None,
         "fuente":    "resultado_persona.aspx (Registro Civil TSE)",
     }
+
+
+def _parse_detalle_nacimiento(html: str) -> dict:
+    """
+    Extrae lugar_nacimiento de detalle_nacimiento.aspx.
+    IDs observados en la página del TSE:
+      lblProvincia, lblCanton, lblDistrito — lugar de nacimiento
+    Retorna dict con claves no vacías solamente.
+    """
+    s = _spans(html)
+
+    def g(*keys: str) -> str:
+        for k in keys:
+            v = s.get(k, "").strip()
+            if v:
+                return v
+        return ""
+
+    # Intentar múltiples variantes de ID (el TSE usa naming inconsistente)
+    provincia  = g("lblProvincia",  "lblprovincia",  "lbl_provincia",  "lblProvinciaNac")
+    canton     = g("lblCanton",     "lblcanton",     "lbl_canton",     "lblCantonNac")
+    distrito   = g("lblDistrito",   "lbldistrito",   "lbl_distrito",   "lblDistritoNac")
+
+    # Si los IDs anteriores no coinciden, intentar capturar todo el texto y buscar patrones
+    if not provincia:
+        # Fallback: extraer todo el texto visible y buscar la sección de lugar de nacimiento
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        # Buscar patrones como "Provincia: San José" o "San José" después de "Provincia"
+        m = re.search(r"Provincia[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|Cantón|$)", text)
+        if m:
+            provincia = m.group(1).strip().title()
+        m = re.search(r"Cant[oó]n[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|Distrito|$)", text)
+        if m:
+            canton = m.group(1).strip().title()
+        m = re.search(r"Distrito[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|[A-Z]{3,}|$)", text)
+        if m:
+            distrito = m.group(1).strip().title()
+
+    result = {}
+    if provincia or canton or distrito:
+        result["lugar_nacimiento"] = {
+            "provincia": provincia or None,
+            "canton":    canton or None,
+            "distrito":  distrito or None,
+        }
+
+    # Dump de todos los spans para debugging (se puede quitar en prod)
+    non_empty_spans = {k: v for k, v in s.items() if v}
+    if non_empty_spans and not result:
+        # Primera vez: devolvemos todo para que podamos ver los IDs reales
+        result["_detalle_spans"] = non_empty_spans
+
+    return result
 
 
 _ROW = re.compile(
