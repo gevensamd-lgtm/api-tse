@@ -448,54 +448,40 @@ def _parse_persona(html: str, ced: str) -> dict:
 
 def _parse_detalle_nacimiento(html: str) -> dict:
     """
-    Extrae lugar_nacimiento de detalle_nacimiento.aspx.
-    IDs observados en la página del TSE:
-      lblProvincia, lblCanton, lblDistrito — lugar de nacimiento
-    Retorna dict con claves no vacías solamente.
+    Extrae datos adicionales de detalle_nacimiento.aspx.
+    IDs confirmados del TSE (2025):
+      lbllugar_nacimiento  → "DISTRITO CANTON PROVINCIA" (todo en un string)
+      lblfecha_nacimiento  → "DD/MM/YYYY"
+      lblnombre_padre      → nombre completo del padre
+      lblid_padre          → cédula del padre
+      lblnombre_madre      → nombre completo de la madre
+      lblid_madre          → cédula de la madre
+      lblempadronado       → "SI" / "NO"
+      lblfallecido         → "SI" / "NO"
     """
     s = _spans(html)
 
-    def g(*keys: str) -> str:
-        for k in keys:
-            v = s.get(k, "").strip()
-            if v:
-                return v
-        return ""
+    def g(k: str) -> str:
+        return s.get(k, "").strip()
 
-    # Intentar múltiples variantes de ID (el TSE usa naming inconsistente)
-    provincia  = g("lblProvincia",  "lblprovincia",  "lbl_provincia",  "lblProvinciaNac")
-    canton     = g("lblCanton",     "lblcanton",     "lbl_canton",     "lblCantonNac")
-    distrito   = g("lblDistrito",   "lbldistrito",   "lbl_distrito",   "lblDistritoNac")
+    result: dict = {}
 
-    # Si los IDs anteriores no coinciden, intentar capturar todo el texto y buscar patrones
-    if not provincia:
-        # Fallback: extraer todo el texto visible y buscar la sección de lugar de nacimiento
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        # Buscar patrones como "Provincia: San José" o "San José" después de "Provincia"
-        m = re.search(r"Provincia[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|Cantón|$)", text)
-        if m:
-            provincia = m.group(1).strip().title()
-        m = re.search(r"Cant[oó]n[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|Distrito|$)", text)
-        if m:
-            canton = m.group(1).strip().title()
-        m = re.search(r"Distrito[:\s]+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑa-záéíóúñ ]+?)(?:\s{2,}|[A-Z]{3,}|$)", text)
-        if m:
-            distrito = m.group(1).strip().title()
+    lugar = g("lbllugar_nacimiento")
+    if lugar:
+        result["lugar_nacimiento"] = lugar  # "CENTRO GOLFITO PUNTARENAS"
 
-    result = {}
-    if provincia or canton or distrito:
-        result["lugar_nacimiento"] = {
-            "provincia": provincia or None,
-            "canton":    canton or None,
-            "distrito":  distrito or None,
-        }
+    empadronado = g("lblempadronado")
+    if empadronado:
+        result["empadronado"] = empadronado == "SI"
 
-    # Dump de todos los spans para debugging (se puede quitar en prod)
-    non_empty_spans = {k: v for k, v in s.items() if v}
-    if non_empty_spans and not result:
-        # Primera vez: devolvemos todo para que podamos ver los IDs reales
-        result["_detalle_spans"] = non_empty_spans
+    # padre/madre del detalle (más completos para menores sin cédula propia)
+    nombre_padre = g("lblnombre_padre")
+    id_padre     = g("lblid_padre")
+    nombre_madre = g("lblnombre_madre")
+    id_madre     = g("lblid_madre")
+    if nombre_padre or nombre_madre:
+        result["padre"] = {"nombre": nombre_padre or None, "identificacion": id_padre or None}
+        result["madre"] = {"nombre": nombre_madre or None, "identificacion": id_madre or None}
 
     return result
 
