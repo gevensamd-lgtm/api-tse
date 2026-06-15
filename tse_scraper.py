@@ -266,15 +266,16 @@ class TSEScraper:
         html_persona = await page.content()
 
         # Seguir "Ver Más Detalles" → detalle_nacimiento.aspx (lugar de nacimiento)
+        # El botón es un ASP.NET LinkButton con __doPostBack — ID=#LinkButton11
         html_detalle: str | None = None
         try:
-            link = page.locator("a[href*='detalle_nacimiento']")
+            link = page.locator("#LinkButton11, a[title*='detalles del nacimiento']")
             if await link.count() > 0:
                 async with page.expect_navigation(wait_until="domcontentloaded", timeout=QUERY_TIMEOUT):
                     await link.first.click()
                 html_detalle = await page.content()
         except Exception:
-            pass  # fail-soft: si no hay enlace o falla, se continúa sin detalle
+            pass  # fail-soft
 
         return html_persona, html_detalle
 
