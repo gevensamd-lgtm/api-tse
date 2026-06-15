@@ -1,18 +1,18 @@
 """
-TSE Registro Civil scraper — v4 FAST
+TSE Registro Civil scraper — v5 FAST
 
 Estrategia:
-  1. Warmup (una vez): Playwright abre el formulario y resuelve el desafío
-     Radware Bot Manager. El contexto del browser queda con las cookies.
-  2. Consultas rápidas: usa `browser_context.request` de Playwright — el mismo
-     contexto que el browser, con el mismo fingerprint TLS y las mismas cookies.
-     Sin rendering, sin DOM, solo HTTP. Latencia ~150-400 ms por consulta.
+  1. Warmup: Playwright abre las páginas del formulario una vez → resuelve
+     Radware Bot Manager (JS challenge). Los páginas se mantienen abiertas.
+  2. Consultas rápidas: usa page.evaluate() con window.fetch() ejecutado DENTRO
+     del contexto del browser. El fetch() corre con:
+       - Fingerprint TLS de Chromium real (JA3/JA4 idéntico al browser)
+       - Cookies de sesión Radware ya en el contexto
+       - Mismo origen que el formulario TSE → sin CORS
+     No hay rendering de DOM; solo recibimos el HTML de la respuesta HTTP.
+  3. Caché LRU 24h, 1 000 cédulas máximo.
 
-Por qué no httpx: Radware valida el fingerprint TLS (JA3/JA4). httpx tiene
-fingerprint diferente al Chromium, así que aunque enviemos las cookies, Radware
-las rechaza. `browser_context.request` comparte contexto con el browser real.
-
-Caché LRU en memoria: resultados 24h, máx 1 000 cédulas.
+Latencia esperada: 200-600ms por consulta (solo round-trip de red a TSE).
 """
 import asyncio
 import re
@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from typing import Optional
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Page, async_playwright
 
 BASE = "https://servicioselectorales.tse.go.cr/chc"
 URL_CEDULA = f"{BASE}/consulta_cedula.aspx"
@@ -29,9 +29,11 @@ UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-COOKIE_TTL   = 3600    # 1 hora — renovar warmup Radware
-CACHE_TTL    = 86400   # 24 horas — cachear resultados
-MAX_CACHE    = 1_000
+NAV_TIMEOUT     = 90_000
+SELECTOR_TIMEOUT = 60_000
+COOKIE_TTL      = 3_600    # 1 hora — renovar warmup Radware
+CACHE_TTL       = 86_400   # 24 horas
+MAX_CACHE       = 1_000
 
 _STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -42,6 +44,60 @@ window.chrome = {runtime: {}};
 const orig = navigator.permissions.query.bind(navigator.permissions);
 navigator.permissions.query = (p) =>
     p.name === 'notifications' ? Promise.resolve({state: 'denied'}) : orig(p);
+"""
+
+# JS ejecutado dentro del browser Chromium para hacer fetch sin rendering
+_JS_FETCH_CEDULA = """
+async ([urlForm, ced]) => {
+    // GET formulario — obtener ViewState actualizado
+    const fg = await fetch(urlForm, {credentials: 'include', redirect: 'follow'});
+    const fh = await fg.text();
+    const dp = new DOMParser();
+    const fd = dp.parseFromString(fh, 'text/html');
+    const vs  = fd.getElementById('__VIEWSTATE')?.value ?? '';
+    const vsg = fd.getElementById('__VIEWSTATEGENERATOR')?.value ?? '';
+    const ev  = fd.getElementById('__EVENTVALIDATION')?.value ?? '';
+
+    // POST cédula
+    const body = new URLSearchParams({
+        '__VIEWSTATE': vs, '__VIEWSTATEGENERATOR': vsg, '__EVENTVALIDATION': ev,
+        'txtcedula': ced, 'btnConsultaCedula': 'Consultar',
+    });
+    const rp = await fetch(urlForm, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: body.toString(),
+        credentials: 'include',
+        redirect: 'follow',
+    });
+    return await rp.text();
+}
+"""
+
+_JS_FETCH_NOMBRES = """
+async ([urlForm, nombre, ap1, ap2]) => {
+    const fg = await fetch(urlForm, {credentials: 'include', redirect: 'follow'});
+    const fh = await fg.text();
+    const dp = new DOMParser();
+    const fd = dp.parseFromString(fh, 'text/html');
+    const vs  = fd.getElementById('__VIEWSTATE')?.value ?? '';
+    const vsg = fd.getElementById('__VIEWSTATEGENERATOR')?.value ?? '';
+    const ev  = fd.getElementById('__EVENTVALIDATION')?.value ?? '';
+
+    const body = new URLSearchParams({
+        '__VIEWSTATE': vs, '__VIEWSTATEGENERATOR': vsg, '__EVENTVALIDATION': ev,
+        'txtnombre': nombre, 'txtapellido1': ap1, 'txtapellido2': ap2,
+        'btnConsultarNombre': 'Consultar',
+    });
+    const rp = await fetch(urlForm, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: body.toString(),
+        credentials: 'include',
+        redirect: 'follow',
+    });
+    return await rp.text();
+}
 """
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -57,21 +113,9 @@ def _spans(html: str) -> dict:
     return out
 
 
-def _extract_viewstate(html: str) -> dict:
-    def _val(name: str) -> str:
-        m = re.search(rf'id="{name}"\s+value="([^"]*)"', html, re.I)
-        return m.group(1) if m else ""
-    return {
-        "vs":  _val("__VIEWSTATE"),
-        "vsg": _val("__VIEWSTATEGENERATOR"),
-        "ev":  _val("__EVENTVALIDATION"),
-    }
-
-
-def _is_blocked(html: str, status: int) -> bool:
-    if status == 403:
-        return True
-    return "rbzid" in html[:2000] or "Bot Manager" in html[:2000]
+def _is_blocked(html: str) -> bool:
+    t = html[:3000]
+    return ("rbzid" in t and "Bot Manager" in t) or "challenge" in t.lower()[:500]
 
 # ─── caché LRU ──────────────────────────────────────────────────────────────
 
@@ -101,14 +145,17 @@ class _LRUCache:
 # ─── scraper ─────────────────────────────────────────────────────────────────
 
 class TSEScraper:
-    def __init__(self, headless: bool = True, max_concurrency: int = 8):
+    def __init__(self, headless: bool = True, max_concurrency: int = 4):
         self._headless = headless
         self._pw = None
         self._browser = None
-        self._ctx = None                  # BrowserContext con cookies Radware
-        self._cookies_at: float = 0.0
+        self._ctx = None
+        self._page_cedula: Optional[Page] = None
+        self._page_nombres: Optional[Page] = None
+        self._warmed_at: float = 0.0
         self._warm_lock = asyncio.Lock()
-        self._sem = asyncio.Semaphore(max_concurrency)
+        self._lock_cedula = asyncio.Lock()   # serializa fetches sobre la misma página
+        self._lock_nombres = asyncio.Lock()
         self._cache = _LRUCache(MAX_CACHE, CACHE_TTL)
 
     # ── ciclo de vida ────────────────────────────────────────────────────────
@@ -126,7 +173,6 @@ class TSEScraper:
                 "--lang=es-CR",
             ],
         )
-        # Warm en background — no bloquea el arranque del servidor
         asyncio.create_task(self._warm())
 
     async def stop(self):
@@ -142,13 +188,10 @@ class TSEScraper:
     # ── warmup Radware ───────────────────────────────────────────────────────
 
     async def _warm(self):
-        """Abre la página con Playwright para resolver el desafío Radware.
-        Guarda el BrowserContext con las cookies de bypass."""
         async with self._warm_lock:
-            if time.time() - self._cookies_at < COOKIE_TTL:
-                return   # ya frescos
+            if time.time() - self._warmed_at < COOKIE_TTL:
+                return
 
-            # Crear nuevo contexto
             ctx = await self._browser.new_context(
                 user_agent=UA,
                 locale="es-CR",
@@ -157,91 +200,65 @@ class TSEScraper:
                 color_scheme="light",
                 java_script_enabled=True,
             )
-            ctx.set_default_navigation_timeout(90_000)
+            ctx.set_default_navigation_timeout(NAV_TIMEOUT)
+            ctx.set_default_timeout(NAV_TIMEOUT)
             await ctx.add_init_script(_STEALTH_JS)
 
-            page = await ctx.new_page()
-            try:
-                await page.goto(URL_CEDULA, wait_until="domcontentloaded")
-                await page.wait_for_selector("#txtcedula", timeout=60_000)
-                # Contexto con cookies válidas, guardarlo para requests rápidos
-                if self._ctx and self._ctx != ctx:
-                    try:
-                        await self._ctx.close()
-                    except Exception:
-                        pass
-                self._ctx = ctx
-                self._cookies_at = time.time()
-            except Exception:
+            # Abrir ambas páginas con retry
+            p_ced = await self._open_warm(ctx, URL_CEDULA, "#txtcedula")
+            p_nom = await self._open_warm(ctx, URL_NOMBRES, "#txtnombre")
+
+            # Cerrar contexto anterior si existe
+            if self._ctx and self._ctx is not ctx:
                 try:
-                    await ctx.close()
+                    await self._ctx.close()
                 except Exception:
                     pass
-                raise
-            finally:
+
+            self._ctx = ctx
+            self._page_cedula = p_ced
+            self._page_nombres = p_nom
+            self._warmed_at = time.time()
+
+    async def _open_warm(self, ctx, url: str, selector: str) -> Page:
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(2 ** attempt)
+            page = await ctx.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+                await page.wait_for_selector(selector, timeout=SELECTOR_TIMEOUT)
+                return page
+            except Exception as e:
                 try:
                     await page.close()
                 except Exception:
                     pass
+                if attempt == 2:
+                    raise RuntimeError(f"Warm falló para {url}: {e}")
 
     async def _ensure_warm(self):
-        if time.time() - self._cookies_at >= COOKIE_TTL or self._ctx is None:
+        if time.time() - self._warmed_at >= COOKIE_TTL or self._page_cedula is None:
             await self._warm()
 
-    # ── consultas rápidas vía browser_context.request ────────────────────────
-    # Usar ctx.request en vez de httpx porque Radware valida fingerprint TLS.
-    # browser_context.request comparte el mismo contexto + cookies + TLS.
+    # ── fetches via page.evaluate() ──────────────────────────────────────────
 
-    async def _ctx_post_cedula(self, ced: str) -> str:
-        """GET formulario → extraer ViewState → POST cédula.
-        Retorna el HTML de resultado_persona.aspx."""
-        req = self._ctx.request   # APIRequestContext compartido con el browser
+    async def _js_fetch_cedula(self, ced: str) -> str:
+        """Ejecuta fetch() dentro del browser Chromium — fingerprint TLS real."""
+        try:
+            html = await self._page_cedula.evaluate(_JS_FETCH_CEDULA, [URL_CEDULA, ced])
+            return html or ""
+        except Exception as e:
+            raise RuntimeError(f"page.evaluate falló para cédula: {e}")
 
-        # 1. GET formulario
-        r_get = await req.get(URL_CEDULA)
-        html_form = await r_get.text()
-        if _is_blocked(html_form, r_get.status):
-            raise RuntimeError("Radware bloqueó GET formulario")
-
-        vs = _extract_viewstate(html_form)
-
-        # 2. POST cédula (sigue redirects automáticamente)
-        r_post = await req.post(URL_CEDULA, form={
-            "__VIEWSTATE":          vs["vs"],
-            "__VIEWSTATEGENERATOR": vs["vsg"],
-            "__EVENTVALIDATION":    vs["ev"],
-            "txtcedula":            ced,
-            "btnConsultaCedula":    "Consultar",
-        })
-        html = await r_post.text()
-        if _is_blocked(html, r_post.status):
-            raise RuntimeError("Radware bloqueó POST cédula")
-        return html
-
-    async def _ctx_post_nombres(self, nombre: str, ap1: str, ap2: str) -> str:
-        """GET formulario nombres → extraer ViewState → POST."""
-        req = self._ctx.request
-
-        r_get = await req.get(URL_NOMBRES)
-        html_form = await r_get.text()
-        if _is_blocked(html_form, r_get.status):
-            raise RuntimeError("Radware bloqueó GET nombres")
-
-        vs = _extract_viewstate(html_form)
-
-        r_post = await req.post(URL_NOMBRES, form={
-            "__VIEWSTATE":          vs["vs"],
-            "__VIEWSTATEGENERATOR": vs["vsg"],
-            "__EVENTVALIDATION":    vs["ev"],
-            "txtnombre":            nombre,
-            "txtapellido1":         ap1 or "",
-            "txtapellido2":         ap2 or "",
-            "btnConsultarNombre":   "Consultar",
-        })
-        html = await r_post.text()
-        if _is_blocked(html, r_post.status):
-            raise RuntimeError("Radware bloqueó POST nombres")
-        return html
+    async def _js_fetch_nombres(self, nombre: str, ap1: str, ap2: str) -> str:
+        try:
+            html = await self._page_nombres.evaluate(
+                _JS_FETCH_NOMBRES, [URL_NOMBRES, nombre, ap1 or "", ap2 or ""]
+            )
+            return html or ""
+        except Exception as e:
+            raise RuntimeError(f"page.evaluate falló para nombres: {e}")
 
     # ── API pública ──────────────────────────────────────────────────────────
 
@@ -250,24 +267,34 @@ class TSEScraper:
         if not ced:
             raise ValueError("Cédula inválida")
 
-        # Cache hit → respuesta instantánea
         cached = self._cache.get(ced)
         if cached is not None:
             return cached
 
-        async with self._sem:
+        async with self._lock_cedula:
+            # Double-check caché tras obtener lock
+            cached = self._cache.get(ced)
+            if cached is not None:
+                return cached
             return await self._fetch_cedula(ced)
 
     async def _fetch_cedula(self, ced: str, retry: bool = True) -> dict:
         await self._ensure_warm()
         try:
-            html = await self._ctx_post_cedula(ced)
+            html = await self._js_fetch_cedula(ced)
         except RuntimeError:
             if retry:
-                self._cookies_at = 0
+                self._warmed_at = 0
                 await self._warm()
                 return await self._fetch_cedula(ced, retry=False)
             raise
+
+        if _is_blocked(html):
+            if retry:
+                self._warmed_at = 0
+                await self._warm()
+                return await self._fetch_cedula(ced, retry=False)
+            raise RuntimeError("Radware bloqueó la consulta de cédula")
 
         result = _parse_persona(html, ced)
         if result.get("encontrado"):
@@ -280,7 +307,7 @@ class TSEScraper:
         if not nombre or not nombre.strip():
             raise ValueError("El campo 'nombre' es obligatorio para el TSE")
 
-        async with self._sem:
+        async with self._lock_nombres:
             return await self._fetch_nombres(nombre, apellido1, apellido2)
 
     async def _fetch_nombres(
@@ -288,22 +315,33 @@ class TSEScraper:
     ) -> dict:
         await self._ensure_warm()
         try:
-            html = await self._ctx_post_nombres(nombre, ap1, ap2)
+            html = await self._js_fetch_nombres(nombre, ap1, ap2)
         except RuntimeError:
             if retry:
-                self._cookies_at = 0
+                self._warmed_at = 0
                 await self._warm()
                 return await self._fetch_nombres(nombre, ap1, ap2, retry=False)
             raise
 
+        if _is_blocked(html):
+            if retry:
+                self._warmed_at = 0
+                await self._warm()
+                return await self._fetch_nombres(nombre, ap1, ap2, retry=False)
+            raise RuntimeError("Radware bloqueó la consulta de nombres")
+
         return _parse_lista_nombres(html)
 
     async def health(self) -> dict:
-        warm = time.time() - self._cookies_at < COOKIE_TTL and self._ctx is not None
+        warm = (
+            time.time() - self._warmed_at < COOKIE_TTL
+            and self._page_cedula is not None
+            and not self._page_cedula.is_closed()
+        )
         return {
             "status":        "ok" if warm else "warming",
             "bot_wall":      "superado" if warm else "pendiente",
-            "cookies_age_s": int(time.time() - self._cookies_at) if self._cookies_at else None,
+            "cookies_age_s": int(time.time() - self._warmed_at) if self._warmed_at else None,
             "cache_entries": len(self._cache._d),
         }
 
